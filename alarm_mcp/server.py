@@ -12,6 +12,7 @@ from fastmcp import FastMCP
 
 from . import apns as apns_mod
 from . import notifier as notifier_mod
+from .classifier import classify, suggest_poll_seconds
 from .evaluator import evaluate
 from .models import Alarm, Store
 from .notifier import fire
@@ -310,6 +311,114 @@ def _build_http_app():
         ok = await _do()
         return JSONResponse({"ok": ok})
 
+    async def create_alarm_http(request: Request):
+        """Create an alarm from a natural-language prompt over plain HTTP.
+
+        This is the endpoint the Wake Up When iOS app calls when the user
+        submits a prompt in the composer. It mirrors the ``create_alarm`` MCP
+        tool but is callable from any HTTP client.
+
+        Request JSON:
+            {
+              "prompt": "wake me up when Rishabh Pant comes to bat",
+              "device_token": "<apns hex token, optional>",
+              "label": "Pant batting",         // optional, shown when fired
+              "source_hint": "cricket",        // optional, override classifier
+              "poll_seconds": 20,              // optional, override default
+              "platform": "ios",               // optional, for token registration
+              "env": "sandbox" | "production"  // optional
+            }
+
+        Response JSON:
+            {
+              "ok": true,
+              "alarm": { ... full Alarm model ... },
+              "trigger": {
+                "category": "cricket" | "price" | "live_event" | "unknown",
+                "source_hint": "...",
+                "supported": true|false,
+                "params": { ... },
+                "notes": "..."
+              }
+            }
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "bad json"}, status_code=400)
+
+        prompt = (body.get("prompt") or body.get("condition") or "").strip()
+        if not prompt:
+            return JSONResponse(
+                {"error": "missing 'prompt'", "field": "prompt"},
+                status_code=400,
+            )
+        if len(prompt) > 1000:
+            return JSONResponse(
+                {"error": "prompt too long (max 1000 chars)", "field": "prompt"},
+                status_code=400,
+            )
+
+        trigger = classify(prompt)
+
+        # Caller-provided overrides take precedence over the classifier.
+        source_hint = body.get("source_hint") or trigger.source_hint
+        try:
+            poll_seconds = int(body.get("poll_seconds") or suggest_poll_seconds(trigger))
+        except (TypeError, ValueError):
+            return JSONResponse(
+                {"error": "poll_seconds must be an integer"}, status_code=400
+            )
+        poll_seconds = max(5, poll_seconds)
+
+        label = (body.get("label") or prompt)[:200].strip()
+
+        # Opportunistically register the device's APNs token so the alarm can
+        # actually push when it fires.  We don't require it (some clients may
+        # register separately via /devices/register).
+        device_token = (body.get("device_token") or "").strip()
+        if device_token and len(device_token) >= 32:
+            apns_tokens.add(device_token, meta={
+                "platform": body.get("platform", "ios"),
+                "app_version": body.get("app_version"),
+                "env": body.get("env"),
+            })
+
+        alarm = Alarm(
+            condition=prompt,
+            label=label,
+            source_hint=source_hint,
+            poll_seconds=poll_seconds,
+        )
+        async with _lock:
+            store.put(alarm)
+
+        return JSONResponse({
+            "ok": True,
+            "alarm": alarm.model_dump(),
+            "trigger": trigger.to_dict(),
+        }, status_code=201)
+
+    async def list_alarms_http(_request: Request):
+        """List all alarms. Mirrors the ``list_alarms`` MCP tool."""
+        async with _lock:
+            items = store.all()
+        items.sort(key=lambda a: a.created_at, reverse=True)
+        return JSONResponse({"alarms": [a.model_dump() for a in items]})
+
+    async def cancel_alarm_http(request: Request):
+        """Cancel/delete an alarm. Mirrors the ``cancel_alarm`` MCP tool."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        alarm_id = (body.get("alarm_id") or request.path_params.get("alarm_id") or "").strip()
+        if not alarm_id:
+            return JSONResponse({"error": "missing alarm_id"}, status_code=400)
+        async with _lock:
+            deleted = store.delete(alarm_id)
+        return JSONResponse({"ok": deleted, "alarm_id": alarm_id})
+
     async def test_apns(_request):
         """Send a test push to every registered device. Handy for debugging."""
         tokens = apns_tokens.all()
@@ -332,6 +441,10 @@ def _build_http_app():
             Route("/", health),
             Route("/devices/register", register_device, methods=["POST"]),
             Route("/devices/unregister", unregister_device, methods=["POST"]),
+            Route("/alarms", create_alarm_http, methods=["POST"]),
+            Route("/alarms", list_alarms_http, methods=["GET"]),
+            Route("/alarms/create", create_alarm_http, methods=["POST"]),
+            Route("/alarms/cancel", cancel_alarm_http, methods=["POST"]),
             Route("/alarms/dismiss", dismiss_alarm, methods=["POST"]),
             Route("/debug/test-push", test_apns, methods=["POST", "GET"]),
             Mount("/", app=mcp_app),
