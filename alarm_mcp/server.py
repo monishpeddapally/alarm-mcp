@@ -10,6 +10,8 @@ from typing import Optional
 
 from fastmcp import FastMCP
 
+from . import apns as apns_mod
+from . import notifier as notifier_mod
 from .evaluator import evaluate
 from .models import Alarm, Store
 from .notifier import fire
@@ -18,8 +20,11 @@ from .sources import fetch_snapshot
 
 STATE_DIR = Path(os.environ.get("ALARM_MCP_STATE_DIR", Path.home() / ".alarm-mcp"))
 STATE_FILE = STATE_DIR / "state.json"
+APNS_TOKENS_FILE = STATE_DIR / "apns_tokens.json"
 
 store = Store(STATE_FILE)
+apns_tokens = apns_mod.TokenStore(APNS_TOKENS_FILE)
+notifier_mod.set_apns_token_store(apns_tokens)
 _lock = asyncio.Lock()
 _poll_task: Optional[asyncio.Task] = None
 
@@ -218,6 +223,7 @@ def _build_http_app():
     which BaseHTTPMiddleware buffers and breaks.
     """
     from starlette.applications import Starlette
+    from starlette.requests import Request
     from starlette.responses import PlainTextResponse, JSONResponse
     from starlette.routing import Mount, Route
 
@@ -257,11 +263,77 @@ def _build_http_app():
     async def health(_request):
         return PlainTextResponse("ok")
 
+    async def register_device(request: Request):
+        """Wake Up When iOS app POSTs its APNs device token here."""
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "bad json"}, status_code=400)
+        token = (body.get("token") or "").strip()
+        if not token or len(token) < 32:
+            return JSONResponse({"error": "missing or invalid 'token'"}, status_code=400)
+        meta = {
+            "platform": body.get("platform", "ios"),
+            "app_version": body.get("app_version"),
+            "env": body.get("env"),  # "sandbox" or "production"
+        }
+        apns_tokens.add(token, meta=meta)
+        return JSONResponse({"ok": True, "registered_tokens": len(apns_tokens.all())})
+
+    async def unregister_device(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "bad json"}, status_code=400)
+        token = (body.get("token") or "").strip()
+        if token:
+            apns_tokens.remove(token)
+        return JSONResponse({"ok": True, "registered_tokens": len(apns_tokens.all())})
+
+    async def dismiss_alarm(request: Request):
+        """App calls this when the user taps Dismiss, so the server clears state."""
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        alarm_id = (body.get("alarm_id") or "").strip()
+        if not alarm_id:
+            return JSONResponse({"error": "missing alarm_id"}, status_code=400)
+        async def _do():
+            async with _lock:
+                a = store.get(alarm_id)
+                if a:
+                    a.status = "done"
+                    store.put(a)
+                    return True
+                return False
+        ok = await _do()
+        return JSONResponse({"ok": ok})
+
+    async def test_apns(_request):
+        """Send a test push to every registered device. Handy for debugging."""
+        tokens = apns_tokens.all()
+        if not tokens:
+            return JSONResponse({"error": "no devices registered"}, status_code=404)
+        if not apns_mod.is_configured():
+            return JSONResponse({"error": "APNs not configured on server"}, status_code=503)
+        results = await apns_mod.send_alarm_push(
+            tokens,
+            alarm_id="test-" + str(int(time.time())),
+            title="Wake Up When — Test",
+            body="If you can read this, push routing works.",
+        )
+        return JSONResponse({"results": results, "count": len(tokens)})
+
     mcp_app = mcp.http_app(path="/mcp")
     app = Starlette(
         routes=[
             Route("/health", health),
             Route("/", health),
+            Route("/devices/register", register_device, methods=["POST"]),
+            Route("/devices/unregister", unregister_device, methods=["POST"]),
+            Route("/alarms/dismiss", dismiss_alarm, methods=["POST"]),
+            Route("/debug/test-push", test_apns, methods=["POST", "GET"]),
             Mount("/", app=mcp_app),
         ],
         lifespan=mcp_app.lifespan,

@@ -34,10 +34,19 @@ from typing import Optional
 
 import httpx
 
+from . import apns as _apns
 from .models import Alarm
 
 
 DEFAULT_RING_SECONDS = int(os.environ.get("ALARM_MCP_RING_SECONDS", "20"))
+
+# Lazy-injected by server.py so notifier doesn't import the store directly.
+_apns_token_store: "_apns.TokenStore | None" = None
+
+
+def set_apns_token_store(store: "_apns.TokenStore") -> None:
+    global _apns_token_store
+    _apns_token_store = store
 
 
 async def fire(alarm: Alarm, evidence: str = "") -> list[str]:
@@ -57,6 +66,9 @@ async def fire(alarm: Alarm, evidence: str = "") -> list[str]:
 
     if webhook := os.environ.get("ALARM_MCP_WEBHOOK"):
         tasks.append(("webhook", _webhook(webhook, alarm, evidence)))
+
+    if _apns.is_configured() and _apns_token_store and _apns_token_store.all():
+        tasks.append(("apns", _send_apns(alarm, evidence)))
 
     if not tasks:
         # last-resort: print loudly to stderr so the user at least sees something
@@ -141,6 +153,32 @@ async def _ntfy(topic: str, alarm: Alarm, evidence: str) -> None:
     body = f"{alarm.condition}\n\n{evidence}".strip()
     async with httpx.AsyncClient(timeout=10) as client:
         await client.post(url, headers=headers, content=body.encode())
+
+
+# --- APNs push (Wake Up When iOS app) --------------------------------------
+
+async def _send_apns(alarm: Alarm, evidence: str) -> None:
+    assert _apns_token_store is not None
+    tokens = _apns_token_store.all()
+    if not tokens:
+        return
+    title = (alarm.label or alarm.condition or "Wake Up When")[:120]
+    body = (evidence or alarm.condition or "")[:240]
+    results = await _apns.send_alarm_push(
+        tokens,
+        alarm_id=alarm.id,
+        title=title,
+        body=body,
+        sound=os.environ.get("ALARM_MCP_APNS_SOUND", "alarm.caf"),
+    )
+    # Drop tokens APNs explicitly rejects so the list stays clean.
+    for tok, status in results.items():
+        if isinstance(status, str) and (
+            status.startswith("410:")
+            or "BadDeviceToken" in status
+            or "Unregistered" in status
+        ):
+            _apns_token_store.remove(tok)
 
 
 # --- Generic webhook -------------------------------------------------------
