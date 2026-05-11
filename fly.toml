@@ -1,0 +1,40 @@
+# Fly.io config. Run `fly launch --no-deploy` once to claim an app name,
+# then `fly deploy`. Set secrets first (see DEPLOY.md).
+
+app = "alarm-mcp"          # change this to something globally unique
+primary_region = "iad"      # closest to you; "sjc" for Bay Area, "iad" for east coast
+
+[build]
+
+[env]
+  ALARM_MCP_TRANSPORT = "http"
+  ALARM_MCP_HOST = "0.0.0.0"
+  PORT = "8000"
+  ALARM_MCP_STATE_DIR = "/data"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = "off"   # IMPORTANT: must stay running to poll alarms
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 50
+    hard_limit = 100
+
+[[http_service.checks]]
+  grace_period = "10s"
+  interval = "30s"
+  method = "get"
+  timeout = "5s"
+  path = "/health"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+
+[[mounts]]
+  source = "alarm_data"
+  destination = "/data"
